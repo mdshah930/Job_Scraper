@@ -1,0 +1,54 @@
+name: Gmail Connectivity Check
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Test Gmail TLS connections without login or email
+        run: |
+          python3 -u - <<'PY'
+          import smtplib
+          import ssl
+
+          passed = 0
+          for port, mode in [(465, 'ssl'), (587, 'starttls')]:
+              client = None
+              stage = 'connect and greeting' if mode == 'starttls' else 'connect, TLS and greeting'
+              print(f'TEST port={port} security={mode}', flush=True)
+              try:
+                  context = ssl.create_default_context()
+                  if mode == 'ssl':
+                      client = smtplib.SMTP_SSL('smtp.gmail.com', port, timeout=20, context=context)
+                  else:
+                      client = smtplib.SMTP('smtp.gmail.com', port, timeout=20)
+                  stage = 'EHLO'
+                  code, _ = client.ehlo()
+                  if code != 250:
+                      raise RuntimeError(f'EHLO returned {code}')
+                  if mode == 'starttls':
+                      stage = 'STARTTLS'
+                      client.starttls(context=context)
+                      stage = 'EHLO after TLS'
+                      code, _ = client.ehlo()
+                      if code != 250:
+                          raise RuntimeError(f'EHLO returned {code}')
+                  stage = 'NOOP'
+                  code, _ = client.noop()
+                  if code != 250:
+                      raise RuntimeError(f'NOOP returned {code}')
+                  print(f'PASS port={port}: connection and TLS work; login and sending NOT tested')
+                  passed += 1
+              except Exception as error:
+                  print(f'FAIL port={port} stage={stage} error={type(error).__name__}')
+              finally:
+                  if client is not None:
+                      client.close()
+          if not passed:
+              raise SystemExit('Neither connection test passed. No login or email was attempted.')
+          PY
