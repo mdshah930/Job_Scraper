@@ -344,26 +344,80 @@ def send_smtp(settings, text, body, attachment):
     message['From'], message['To'] = settings['MAIL_FROM'], settings['MAIL_TO']
     message.set_content(text)
     message.add_alternative(body, subtype='html')
-    message.add_attachment(attachment.encode('utf-8'), maintype='text', subtype='csv', filename='marketing-jobs.csv')
+    message.add_attachment(
+        attachment.encode('utf-8'),
+        maintype='text',
+        subtype='csv',
+        filename='marketing-jobs.csv',
+    )
+
     context = ssl.create_default_context()
-    if settings['SMTP_SECURITY'] == 'ssl':
-        client = smtplib.SMTP_SSL(settings['SMTP_HOST'], settings['SMTP_PORT'], timeout=30, context=context)
-    else:
-        client = smtplib.SMTP(settings['SMTP_HOST'], settings['SMTP_PORT'], timeout=30)
+    client = None
+    stage = 'connect'
+
     try:
+        print(f'SMTP stage={stage}', flush=True)
+        if settings['SMTP_SECURITY'] == 'ssl':
+            client = smtplib.SMTP_SSL(
+                settings['SMTP_HOST'], settings['SMTP_PORT'],
+                timeout=30, context=context,
+            )
+        else:
+            client = smtplib.SMTP(
+                settings['SMTP_HOST'], settings['SMTP_PORT'], timeout=30,
+            )
+
+        stage = 'ehlo'
+        print(f'SMTP stage={stage}', flush=True)
         client.ehlo()
+
         if settings['SMTP_SECURITY'] == 'starttls':
+            stage = 'starttls'
+            print(f'SMTP stage={stage}', flush=True)
             client.starttls(context=context)
+
+            stage = 'ehlo_after_tls'
+            print(f'SMTP stage={stage}', flush=True)
             client.ehlo()
+
+        stage = 'login'
+        print(f'SMTP stage={stage}', flush=True)
         client.login(settings['SMTP_USERNAME'], settings['SMTP_PASSWORD'])
+
+        stage = 'send'
+        print(f'SMTP stage={stage}', flush=True)
         if client.send_message(message):
             raise RuntimeError('SMTP rejected a recipient; ledger unchanged')
+
+        print('SMTP accepted the message; inbox delivery is not confirmed', flush=True)
+
+    except Exception as error:
+        code = getattr(error, 'smtp_code', None)
+        code_label = f' code={code}' if type(code) is int else ''
+        print(
+            f'SMTP failed stage={stage} error={type(error).__name__}{code_label}',
+            flush=True,
+        )
+        if stage == 'send' and isinstance(
+            error, (smtplib.SMTPServerDisconnected, OSError)
+        ):
+            print(
+                'Delivery uncertain: check inbox and Sent before retrying; '
+                'duplicates are possible',
+                flush=True,
+            )
+        raise
+
     finally:
-        # A QUIT failure after DATA acceptance must not turn acceptance into retry.
-        try:
-            client.quit()
-        except (OSError, smtplib.SMTPException):
-            client.close()
+        if client is not None:
+            try:
+                client.quit()
+            except (OSError, smtplib.SMTPException):
+                try:
+                    client.close()
+                except (OSError, smtplib.SMTPException):
+                    pass
+
 
 
 def run_digest(config, results, state_path, output, now, *, dry_run=True,
