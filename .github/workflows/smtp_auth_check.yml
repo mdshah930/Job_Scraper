@@ -1,0 +1,58 @@
+name: Gmail Sign-in Check
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check sign-in without sending email
+        env:
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          python3 -u - <<'PY'
+          import os
+          import smtplib
+          import ssl
+
+          username = os.getenv('SMTP_USERNAME', '')
+          password = os.getenv('SMTP_PASSWORD', '')
+          if username.count('@') != 1 or any(c.isspace() for c in username):
+              raise SystemExit('SETUP: SMTP_USERNAME must be your full Gmail address without whitespace')
+          if len(password) != 16 or not password.isascii() or not password.isalnum():
+              raise SystemExit('SETUP: SMTP_PASSWORD must be the 16-character Google App Password, without spaces or quotes; not your regular password')
+
+          client = None
+          stage = 'connect'
+          try:
+              client = smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=30, context=ssl.create_default_context())
+              stage = 'ehlo'
+              code, _ = client.ehlo()
+              if code != 250:
+                  raise smtplib.SMTPHeloError(code, b'')
+              if 'PLAIN' not in client.esmtp_features.get('auth', '').upper().split():
+                  raise SystemExit('STOP: server did not advertise PLAIN authentication')
+              stage = 'login'
+              print('Testing one AUTH PLAIN exchange over verified TLS; no email will be sent', flush=True)
+              code, _ = client.auth('PLAIN', lambda challenge=None: '\0' + username + '\0' + password)
+              if code != 235:
+                  raise SystemExit('STOP: authentication success was not confirmed')
+              print('PASS: Gmail accepted authentication; no email sent')
+          except Exception as error:
+              code = getattr(error, 'smtp_code', None)
+              suffix = f' code={code}' if type(code) is int else ''
+              print(f'FAIL stage={stage} error={type(error).__name__}{suffix}', flush=True)
+              raise SystemExit(1)
+          finally:
+              if client is not None:
+                  try:
+                      client.close()
+                  except (OSError, smtplib.SMTPException):
+                      pass
+          PY
