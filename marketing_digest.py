@@ -36,6 +36,8 @@ NOT_REMOTE = re.compile(
     r"\b(?:hybrid|onsite|on[ -]site|in[ -]office|non[ -]remote|not remote|no remote|"
     r"remote\s+(?:not|unavailable)|remote\s+(?:work\s+)?(?:is\s+)?not|"
     r"no work from home|not eligible for remote|not a remote)\b", re.I)
+EMAIL_JOB_LIMIT = 50
+
 
 
 def positive_hours(value):
@@ -283,42 +285,324 @@ def validate_results(results, expected_sources):
 
 def csv_text(jobs):
     out = io.StringIO()
-    fields = ['title', 'company', 'location', 'work_arrangement', 'remote_query', 'is_remote',
-              'date_posted', 'posted_precision', 'ats', 'url', 'salary']
-    writer = csv.DictWriter(out, fieldnames=fields, extrasaction='ignore')
+
+    # These are the fields currently available from the LinkedIn/Indeed
+    # adapters. Blank values are expected when a source does not provide a field.
+    fields = [
+        'title',
+        'company',
+        'location',
+        'work_arrangement',
+        'remote_query',
+        'is_remote',
+        'job_type',
+        'salary',
+        'salary_currency',
+        'salary_source',
+        'description',
+        'date_posted',
+        'posted_precision',
+        'ats',
+        'url',
+        'direct_url',
+        'company_url',
+        'emails',
+    ]
+
+    writer = csv.DictWriter(
+        out,
+        fieldnames=fields,
+        extrasaction='ignore',
+    )
     writer.writeheader()
-    for j in jobs:
-        # Avoid spreadsheet formula execution when opening the attachment.
-        writer.writerow({k: ("'" + str(j.get(k, '')) if str(j.get(k, '')).lstrip().startswith(('=', '+', '-', '@'))
-                            else j.get(k, '')) for k in fields})
+
+    for job in jobs:
+        row = {}
+
+        for field in fields:
+            value = job.get(field, '')
+
+            # Avoid spreadsheet formula execution when the CSV is opened.
+            value_text = str(value or '')
+            if value_text.lstrip().startswith(('=', '+', '-', '@')):
+                value = "'" + value_text
+
+            row[field] = value
+
+        writer.writerow(row)
+
     return out.getvalue()
 
 
+
 def render(jobs, results, counts, now, hours, warnings):
-    start = now - timedelta(hours=hours)
-    lines = [f'Marketing jobs: {len(jobs)} new matching openings',
-             f'Run window: {start.isoformat()} through {now.isoformat()} ({hours:g} hours).',
-             'USA OR explicitly remote. Remote does NOT mean worldwide eligible; check each application.',
-             'Date-only postings use UTC calendar dates; exact times and source timezone are unavailable.',
-             'Conservative filtering misses ambiguous dates. Results are bounded, not exhaustive.',
-             f'Candidates: {counts["raw"]}; excluded: {counts["filtered"]}; duplicate/already sent: {counts["duplicate_or_sent"]}.']
-    lines += ['WARNING: ' + w for w in warnings]
-    lines += [f'Source {r["source"]}: {r["status"]}; {r.get("health", {})}; {r.get("note", "")}' for r in results]
-    if not jobs:
-        lines.append('No new qualifying jobs in available source data (not a claim that no jobs exist).')
-    text = '\n'.join(lines) + '\n'
-    body = '<html><body><h1>Marketing job digest</h1>' + ''.join(f'<p>{html.escape(line)}</p>' for line in lines)
-    for j in jobs:
-        arrangement = j.get('work_arrangement') or ('Remote search result; verify eligibility' if j.get('remote_query') else
-                      ('Remote flag from source; verify eligibility' if j.get('is_remote') else 'Arrangement not supplied'))
-        detail = [j.get('title', ''), j.get('company', ''), j.get('location', ''), arrangement,
-                  f'Posted: {j["date_posted"]} ({j["posted_precision"]})', f'Source: {j["ats"]}']
-        if j.get('salary'):
-            detail.append('Salary: ' + str(j['salary']))
-        text += '\n' + '\n'.join(str(x) for x in detail) + '\n' + safe_url(j['url']) + '\n'
-        body += '<section>' + ''.join(f'<p>{html.escape(str(x))}</p>' for x in detail)
-        body += f'<a href="{html.escape(safe_url(j["url"]), quote=True)}">Apply / review restrictions</a></section>'
-    return text, body + '</body></html>', csv_text(jobs)
+    """
+    Render:
+    - A concise plain-text version showing up to 50 jobs.
+    - A compact HTML table showing up to 50 jobs.
+    - A CSV attachment containing all selected jobs.
+
+    Important: do not slice jobs before this function. The full jobs list is
+    needed by run_digest() for CSV generation and sent-ledger updates.
+    """
+    ordered_jobs = sorted(jobs, key=email_sort_key)
+    visible_jobs = ordered_jobs[:EMAIL_JOB_LIMIT]
+
+    coverage_warning = any(
+        'Partial coverage' in warning or
+        'query caps' in warning
+        for warning in warnings
+    )
+
+    title = 'Marketing Job Digest'
+    summary = f'{len(jobs):,} new matching openings'
+    display_summary = (
+        f'{summary} · Showing {len(visible_jobs):,} in this email'
+        if len(jobs) > EMAIL_JOB_LIMIT
+        else summary
+    )
+
+    # -------------------------
+    # Plain-text email version
+    # -------------------------
+    text_lines = [
+        title,
+        display_summary,
+        f'USA or explicitly remote · Last {hours:g} hours',
+        '',
+    ]
+
+    if coverage_warning:
+        text_lines.extend([
+            'Some sources returned incomplete results. '
+            'Additional matching openings may be available.',
+            '',
+        ])
+
+    if not visible_jobs:
+        text_lines.append(
+            'No new matching openings were found in the available source data.'
+        )
+    else:
+        text_lines.extend([
+            'Title | Company | Location | Apply link | Source',
+            '-' * 100,
+        ])
+
+        for job in visible_jobs:
+            text_lines.append(' | '.join([
+                str(job.get('title') or '—'),
+                str(job.get('company') or '—'),
+                str(job.get('location') or '—'),
+                safe_url(job.get('url')) or '—',
+                str(job.get('ats') or '—'),
+            ]))
+
+    text_lines.extend([
+        '',
+        f'The attached CSV contains all {len(jobs):,} matching jobs and '
+        'available source fields.',
+        '',
+        'Posting dates and work eligibility should be verified on the original listing.',
+    ])
+
+    text = '\n'.join(text_lines) + '\n'
+
+    # -------------------------
+    # HTML email version
+    # -------------------------
+    escaped_title = html.escape(title)
+    escaped_summary = html.escape(display_summary)
+    escaped_hours = html.escape(f'{hours:g}')
+
+    body_parts = [
+        '<!DOCTYPE html>',
+        '<html>',
+        '<body style="margin:0;padding:0;background:#f3f6fa;'
+        'font-family:Arial,Helvetica,sans-serif;color:#1f2937;">',
+
+        '<div style="max-width:1100px;margin:0 auto;padding:24px 12px;">',
+
+        '<div style="background:#17365d;color:#ffffff;'
+        'padding:24px 28px;border-radius:10px 10px 0 0;">',
+        f'<div style="font-size:26px;font-weight:700;line-height:1.2;">'
+        f'{escaped_title}</div>',
+        f'<div style="margin-top:8px;font-size:16px;">'
+        f'{escaped_summary}</div>',
+        f'<div style="margin-top:6px;font-size:13px;color:#dbeafe;">'
+        f'USA or explicitly remote · Last {escaped_hours} hours</div>',
+        '</div>',
+
+        '<div style="background:#ffffff;padding:18px 20px 24px;'
+        'border-radius:0 0 10px 10px;'
+        'box-shadow:0 2px 10px rgba(15,23,42,0.08);">',
+    ]
+
+    if coverage_warning:
+        body_parts.extend([
+            '<div style="margin-bottom:16px;padding:10px 12px;'
+            'background:#fff7ed;border-left:4px solid #f59e0b;'
+            'color:#7c2d12;font-size:13px;">',
+            'Some sources returned incomplete results. '
+            'Additional matching openings may be available.',
+            '</div>',
+        ])
+
+    if visible_jobs:
+        body_parts.extend([
+            '<div style="overflow-x:auto;">',
+            '<table role="presentation" cellpadding="0" cellspacing="0" '
+            'style="width:100%;border-collapse:collapse;'
+            'font-size:14px;table-layout:fixed;">',
+
+            '<thead>',
+            '<tr style="background:#e8eef7;color:#17365d;">',
+            '<th align="left" style="width:31%;padding:12px 10px;'
+            'font-size:12px;text-transform:uppercase;letter-spacing:.04em;">'
+            'Title</th>',
+            '<th align="left" style="width:21%;padding:12px 10px;'
+            'font-size:12px;text-transform:uppercase;letter-spacing:.04em;">'
+            'Company</th>',
+            '<th align="left" style="width:24%;padding:12px 10px;'
+            'font-size:12px;text-transform:uppercase;letter-spacing:.04em;">'
+            'Location</th>',
+            '<th align="center" style="width:13%;padding:12px 10px;'
+            'font-size:12px;text-transform:uppercase;letter-spacing:.04em;">'
+            'Apply</th>',
+            '<th align="left" style="width:11%;padding:12px 10px;'
+            'font-size:12px;text-transform:uppercase;letter-spacing:.04em;">'
+            'Source</th>',
+            '</tr>',
+            '</thead>',
+            '<tbody>',
+        ])
+
+        for index, job in enumerate(visible_jobs):
+            row_background = '#ffffff' if index % 2 == 0 else '#f8fafc'
+
+            job_title = html.escape(str(job.get('title') or '—'))
+            company = html.escape(str(job.get('company') or '—'))
+            location = html.escape(str(job.get('location') or '—'))
+            source = html.escape(str(job.get('ats') or '—'))
+
+            apply_url = safe_url(job.get('url'))
+            if apply_url:
+                apply_cell = (
+                    f'<a href="{html.escape(apply_url, quote=True)}" '
+                    'style="display:inline-block;background:#2563eb;color:#ffffff;'
+                    'text-decoration:none;padding:7px 11px;border-radius:5px;'
+                    'font-size:12px;font-weight:700;">'
+                    'View job'
+                    '</a>'
+                )
+            else:
+                apply_cell = '—'
+
+            body_parts.extend([
+                f'<tr style="background:{row_background};'
+                'border-bottom:1px solid #e5e7eb;">',
+
+                '<td style="padding:12px 10px;vertical-align:top;'
+                'line-height:1.4;word-wrap:break-word;">',
+                f'<strong style="color:#111827;">{job_title}</strong>',
+                '</td>',
+
+                '<td style="padding:12px 10px;vertical-align:top;'
+                'line-height:1.4;word-wrap:break-word;">',
+                f'{company}',
+                '</td>',
+
+                '<td style="padding:12px 10px;vertical-align:top;'
+                'line-height:1.4;word-wrap:break-word;">',
+                f'{location}',
+                '</td>',
+
+                '<td align="center" style="padding:12px 10px;'
+                'vertical-align:top;">',
+                apply_cell,
+                '</td>',
+
+                '<td style="padding:12px 10px;vertical-align:top;'
+                'color:#475569;line-height:1.4;word-wrap:break-word;">',
+                f'{source}',
+                '</td>',
+
+                '</tr>',
+            ])
+
+        body_parts.extend([
+            '</tbody>',
+            '</table>',
+            '</div>',
+        ])
+    else:
+        body_parts.append(
+            '<p style="margin:12px 0;font-size:15px;">'
+            'No new matching openings were found in the available source data.'
+            '</p>'
+        )
+
+    body_parts.extend([
+        '<div style="margin-top:20px;padding-top:14px;'
+        'border-top:1px solid #e5e7eb;color:#64748b;font-size:12px;'
+        'line-height:1.6;">',
+        f'Showing {len(visible_jobs):,} of {len(jobs):,} matching jobs. '
+        'The attached CSV contains the complete list and available source fields.',
+        '<br>',
+        'Posting dates and work eligibility should be verified on the original listing.',
+        '</div>',
+
+        '</div>',
+        '</div>',
+        '</body>',
+        '</html>',
+    ])
+
+    body = ''.join(body_parts)
+    return text, body, csv_text(ordered_jobs)
+
+
+def email_sort_key(job):
+    """
+    Sort newest jobs first.
+
+    Exact timezone-aware timestamps are preferred over date-only values when
+    the calendar posting date is the same. Invalid or missing dates go last.
+    """
+    raw = str(job.get('date_posted') or '').strip()
+
+    try:
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw):
+            posted = datetime.strptime(raw, '%Y-%m-%d').replace(tzinfo=UTC)
+            date_only = True
+        else:
+            posted = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+            if posted.tzinfo is None:
+                raise ValueError('Posting timestamp has no timezone')
+            posted = posted.astimezone(UTC)
+            date_only = False
+
+        # Sort by calendar day first.
+        # Exact timestamps come before date-only values on the same day.
+        return (
+            0,
+            -posted.date().toordinal(),
+            1 if date_only else 0,
+            -posted.timestamp() if not date_only else 0,
+            str(job.get('company') or '').casefold(),
+            str(job.get('title') or '').casefold(),
+        )
+
+    except (TypeError, ValueError, OverflowError):
+        return (
+            1,
+            0,
+            1,
+            0,
+            str(job.get('company') or '').casefold(),
+            str(job.get('title') or '').casefold(),
+        )
+
 
 
 def smtp_settings(env):

@@ -11,6 +11,7 @@ import smtplib
 import subprocess
 from unittest.mock import Mock
 from urllib.parse import parse_qs, urlsplit
+import csv
 
 import pandas as pd
 import pytest
@@ -224,7 +225,10 @@ def test_all_failed_partial_and_genuine_zero(config, job, tmp_path, monkeypatch)
     assert any('Partial coverage' in w for w in result['warnings'])
     zero = m.run_digest(config,results({**job,'title':'Toxicologist'}),tmp_path/'sent',tmp_path,NOW)
     assert zero['jobs'] == 0
-    assert 'No new qualifying jobs' in (tmp_path/'digest.txt').read_text()
+    assert 'No new matching openings were found' in (
+    tmp_path / 'digest.txt'
+).read_text()
+
 
 
 @pytest.mark.parametrize('url', ['javascript:alert(1)', 'data:text/html,x', '//example.invalid/path',
@@ -238,13 +242,30 @@ def test_html_and_full_csv(config, job, tmp_path):
                location='Remote - UK residents only', salary='GBP 40000')
     many = [{**job,'url':f'https://www.linkedin.com/jobs/view/{i}/','company':f'{job["company"]} {i}'} for i in range(125)]
     m.run_digest(config,[{**r,'jobs':many if r['source']=='linkedin' else []} for r in results()],tmp_path/'sent',tmp_path,NOW)
-    body=(tmp_path/'digest.html').read_text()
-    assert '<script>' not in body and '<img src=x' not in body
-    assert '&lt;script&gt;' in body and 'UK residents only' in body
-    assert body.count('Apply / review restrictions') == 125
-    assert len(list(__import__('csv').DictReader((tmp_path/'jobs.csv').open()))) == 125
-    assert 'GBP 40000' in body
-    assert "'=HYPERLINK" in m.csv_text([{**job,'title':'=HYPERLINK("x")'}])
+    body = (tmp_path / 'digest.html').read_text()
+
+    assert '<script>' not in body
+    assert '<img src=x' not in body
+    assert '&lt;script&gt;' in body
+    assert 'UK residents only' in body
+
+    # Only 50 jobs appear in the HTML email.
+    assert body.count('View job') == 50
+    assert 'Showing 50 of 125 matching jobs' in body
+
+    # Internal diagnostics do not appear in the user-facing email.
+    assert 'attempted' not in body
+    assert 'succeeded' not in body
+    assert 'duplicate/already sent' not in body
+
+    # All selected jobs remain in the CSV attachment.
+    import csv
+
+    with (tmp_path / 'jobs.csv').open(newline='', encoding='utf-8') as f:
+        csv_rows = list(csv.DictReader(f))
+
+    assert len(csv_rows) == 125
+
 
 
 def synthetic_card(title='Marketing Intern', location='Remote - UK only', ident='999'):
@@ -458,3 +479,87 @@ def test_linkedin_overreturn_is_bounded(config,monkeypatch):
     monkeypatch.setattr(s,'fetch',fetch)
     r=m.collect_source('linkedin',config)
     assert len(r['jobs'])==20 and r['health']['capped']==1
+
+
+@pytest.mark.parametrize('stage,security', [
+    ('connect', 'ssl'), ('connect', 'starttls'), ('ehlo', 'ssl'),
+    ('starttls', 'starttls'), ('ehlo_after_tls', 'starttls'),
+    ('login', 'ssl'), ('send', 'ssl'),
+])
+def test_smtp_stage_failure_is_private(stage, security, monkeypatch, capsys):
+    # Fictional settings, mock connections only; NEVER read credential environment.
+    settings = dict(SMTP_HOST='smtp.example.invalid', SMTP_PORT=465,
+                    SMTP_SECURITY=security, SMTP_USERNAME='synthetic-user',
+                    SMTP_PASSWORD='synthetic-test-only',
+                    MAIL_FROM='sender@example.invalid', MAIL_TO='recipient@example.invalid')
+    error = (smtplib.SMTPAuthenticationError(535, b'synthetic-test-only recipient@example.invalid')
+             if stage == 'login' else smtplib.SMTPServerDisconnected('PRIVATE-SERVER-TEXT'))
+    client = Mock()
+    client.ehlo.return_value = (250, b'ok')
+    client.send_message.return_value = {}
+    constructor = Mock(return_value=client)
+    if stage == 'connect':
+        constructor.side_effect = error
+    elif stage == 'ehlo_after_tls':
+        client.ehlo.side_effect = [(250, b'ok'), error]
+    else:
+        method = {'ehlo': 'ehlo', 'starttls': 'starttls', 'login': 'login', 'send': 'send_message'}[stage]
+        getattr(client, method).side_effect = error
+    monkeypatch.setattr(m.smtplib, 'SMTP_SSL' if security == 'ssl' else 'SMTP', constructor)
+    with pytest.raises(type(error)) as raised:
+        m.send_smtp(settings, 'PRIVATE-BODY', '<p>PRIVATE-BODY</p>', 'PRIVATE-CSV')
+    assert raised.value is error
+    log = capsys.readouterr().out
+    assert f'SMTP failed stage={stage} error={type(error).__name__}' in log
+    for private in ['synthetic-user', 'synthetic-test-only', 'sender@example.invalid',
+                    'recipient@example.invalid', 'PRIVATE-BODY', 'PRIVATE-CSV', 'PRIVATE-SERVER-TEXT']:
+        assert private not in log
+    if stage == 'login':
+        assert 'code=535' in log
+    if stage != 'send':
+        client.send_message.assert_not_called()
+    else:
+        assert 'Delivery uncertain' in log
+    assert 'SMTP accepted' not in log
+
+
+@pytest.mark.parametrize('security', ['ssl', 'starttls'])
+def test_smtp_stage_success_is_private(security, monkeypatch, capsys):
+    settings = dict(SMTP_HOST='smtp.example.invalid', SMTP_PORT=465,
+                    SMTP_SECURITY=security, SMTP_USERNAME='synthetic-user',
+                    SMTP_PASSWORD='synthetic-test-only',
+                    MAIL_FROM='sender@example.invalid', MAIL_TO='recipient@example.invalid')
+    client = Mock()
+    client.send_message.return_value = {}
+    monkeypatch.setattr(m.smtplib, 'SMTP_SSL' if security == 'ssl' else 'SMTP', Mock(return_value=client))
+    m.send_smtp(settings, 'PRIVATE-BODY', '<p>PRIVATE-BODY</p>', 'PRIVATE-CSV')
+    log = capsys.readouterr().out
+    assert all(f'SMTP stage={stage}' in log for stage in ['connect', 'ehlo', 'login', 'send'])
+    assert 'inbox delivery is not confirmed' in log
+    assert 'SMTP failed' not in log
+    assert 'PRIVATE' not in log and 'example.invalid' not in log and 'synthetic-' not in log
+    client.set_debuglevel.assert_not_called()
+
+
+@pytest.mark.parametrize('login_fails', [False, True])
+def test_smtp_cleanup_cannot_hide_result(login_fails, monkeypatch, capsys):
+    settings = dict(SMTP_HOST='smtp.example.invalid', SMTP_PORT=465,
+                    SMTP_SECURITY='ssl', SMTP_USERNAME='synthetic-user',
+                    SMTP_PASSWORD='synthetic-test-only',
+                    MAIL_FROM='sender@example.invalid', MAIL_TO='recipient@example.invalid')
+    client = Mock()
+    client.send_message.return_value = {}
+    client.quit.side_effect = smtplib.SMTPServerDisconnected('synthetic cleanup')
+    client.close.side_effect = OSError('synthetic cleanup')
+    failure = smtplib.SMTPAuthenticationError(535, b'synthetic failure')
+    if login_fails:
+        client.login.side_effect = failure
+    monkeypatch.setattr(m.smtplib, 'SMTP_SSL', Mock(return_value=client))
+    if login_fails:
+        with pytest.raises(smtplib.SMTPAuthenticationError) as raised:
+            m.send_smtp(settings, 'synthetic', 'synthetic', 'synthetic')
+        assert raised.value is failure
+        assert 'stage=login error=SMTPAuthenticationError code=535' in capsys.readouterr().out
+    else:
+        m.send_smtp(settings, 'synthetic', 'synthetic', 'synthetic')
+        assert 'SMTP accepted' in capsys.readouterr().out
